@@ -1,0 +1,9 @@
+# Xcode & macOS build artifacts
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+libsnesapu.dylib
+output.wav
