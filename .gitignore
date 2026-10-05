@@ -8,3 +8,4 @@ xcuserdata/
 libsnesapu.dylib
 output.wav
 snesapu 2026-*
+*.app
