@@ -8,7 +8,13 @@ extension SnesApuVisualState {
         withUnsafeBytes(of: env_levels) { $0[index & 0x07] }
     }
     func voiceOut(_ index: Int) -> Int16 {
-        withUnsafeBytes(of: voice_outs) { $0.load(fromByteOffset: (index & 0x07) * MemoryLayout<Int16>.stride, as: Int16.self) }
+        // Safe unaligned byte load for #pragma pack(1) compatibility on ARM64
+        withUnsafeBytes(of: voice_outs) { raw in
+            let offset = (index & 0x07) * 2
+            let lo = UInt16(raw[offset])
+            let hi = UInt16(raw[offset + 1])
+            return Int16(bitPattern: lo | (hi << 8))
+        }
     }
 }
 
@@ -71,14 +77,17 @@ final class VisualizerView: NSView {
         String("Title : \(engine.title.prefix(22))").draw(at: CGPoint(x: 4, y: 2), withAttributes: textAttrs)
         String("Game  : \(engine.game.prefix(22))").draw(at: CGPoint(x: 4, y: 14), withAttributes: textAttrs)
 
+        let totalDur = max(1.0, engine.songDuration)
         var elapsed = Double(state.t64_ticks) / 64000.0
-        if isScrubbing { elapsed = scrubRatio * engine.songDuration }
+        if isScrubbing { elapsed = scrubRatio * totalDur }
+        let safeElapsed = max(0.0, elapsed)
+        let totalSecs = Int(safeElapsed)
+        let millis = Int((safeElapsed - Double(totalSecs)) * 1000.0)
 
-        let timeStr = String(format: "Time  : %02d:%02d.%03d",
-                             Int(elapsed) / 60, Int(elapsed) % 60, Int(elapsed.truncatingRemainder(dividingBy: 1.0) * 1000.0))
+        let timeStr = String(format: "Time  : %02d:%02d.%03d", totalSecs / 60, totalSecs % 60, millis)
         timeStr.draw(at: CGPoint(x: 4, y: 26), withAttributes: textAttrs)
 
-        let progress = isScrubbing ? scrubRatio : min(1.0, max(0.0, elapsed / engine.songDuration))
+        let progress = isScrubbing ? scrubRatio : min(1.0, max(0.0, safeElapsed / totalDur))
         let barW = 140.0
         ctx.setFillColor(NSColor(hex: "#333333").cgColor)
         ctx.fill(CGRect(x: 140, y: 27, width: barW, height: 5))
@@ -87,8 +96,8 @@ final class VisualizerView: NSView {
         ctx.fill(CGRect(x: 140, y: 27, width: barW * progress, height: 5))
 
         if engine.isTimeRepeatActive {
-            let startX = 140.0 + (engine.repeatStartTime / engine.songDuration) * barW
-            let endX = 140.0 + (engine.repeatLimitTime / engine.songDuration) * barW
+            let startX = 140.0 + (engine.repeatStartTime / totalDur) * barW
+            let endX = 140.0 + (engine.repeatLimitTime / totalDur) * barW
             ctx.setFillColor(NSColor.cyan.cgColor)
             ctx.fill(CGRect(x: startX, y: 24, width: 2, height: 11))
             ctx.setFillColor(NSColor.orange.cgColor)
@@ -103,10 +112,10 @@ final class VisualizerView: NSView {
         ctx.strokeLineSegments(between: [CGPoint(x: 0, y: 45), CGPoint(x: 287, y: 45)])
         ctx.strokeLineSegments(between: [CGPoint(x: 46, y: 45), CGPoint(x: 46, y: 96)])
 
-        let mvolL = Double(abs(Int8(bitPattern: state.dspReg(0x0C)))) / 127.0
-        let mvolR = Double(abs(Int8(bitPattern: state.dspReg(0x1C)))) / 127.0
-        let evolL = Double(abs(Int8(bitPattern: state.dspReg(0x2C)))) / 127.0
-        let evolR = Double(abs(Int8(bitPattern: state.dspReg(0x3C)))) / 127.0
+        let mvolL = Double(abs(Int(Int8(bitPattern: state.dspReg(0x0C))))) / 127.0
+        let mvolR = Double(abs(Int(Int8(bitPattern: state.dspReg(0x1C))))) / 127.0
+        let evolL = Double(abs(Int(Int8(bitPattern: state.dspReg(0x2C))))) / 127.0
+        let evolR = Double(abs(Int(Int8(bitPattern: state.dspReg(0x3C))))) / 127.0
         drawBar(ctx: ctx, x: 4, level: mvolL, width: 3, color: NSColor(hex: "#00AA00"))
         drawBar(ctx: ctx, x: 8, level: mvolR, width: 3, color: NSColor(hex: "#00AA00"))
         drawBar(ctx: ctx, x: 14, level: evolL, width: 3, color: NSColor(hex: "#FF8800"))
@@ -140,9 +149,9 @@ final class VisualizerView: NSView {
             drawFlag(text: "N", x: 22, on: non, hex: "#FFFF00")
 
             let envNorm = Double(state.envLevel(i)) / 128.0
-            let outNorm = Double(abs(state.voiceOut(i))) / 32768.0
-            let vl = Double(abs(Int8(bitPattern: state.dspReg(i << 4 | 0x00)))) / 127.0
-            let vr = Double(abs(Int8(bitPattern: state.dspReg(i << 4 | 0x01)))) / 127.0
+            let outNorm = Double(abs(Int32(state.voiceOut(i)))) / 32768.0
+            let vl = Double(abs(Int(Int8(bitPattern: state.dspReg(i << 4 | 0x00))))) / 127.0
+            let vr = Double(abs(Int(Int8(bitPattern: state.dspReg(i << 4 | 0x01))))) / 127.0
 
             drawBar(ctx: ctx, x: vx + 1, level: vl, width: 3, color: NSColor(hex: "#00CC44"))
             drawBar(ctx: ctx, x: vx + 5, level: vr, width: 3, color: NSColor(hex: "#00CC44"))
@@ -163,10 +172,10 @@ final class VisualizerView: NSView {
         ]
 
         "DSP MIXER & FILTER REGISTERS".draw(at: CGPoint(x: 4, y: 2), withAttributes: headAttrs)
-        let mvolL = isDetailDecMode ? "\(abs(Int8(bitPattern: state.dspReg(0x0C))))" : String(format: "%02X", state.dspReg(0x0C))
-        let mvolR = isDetailDecMode ? "\(abs(Int8(bitPattern: state.dspReg(0x1C))))" : String(format: "%02X", state.dspReg(0x1C))
-        let evolL = isDetailDecMode ? "\(abs(Int8(bitPattern: state.dspReg(0x2C))))" : String(format: "%02X", state.dspReg(0x2C))
-        let evolR = isDetailDecMode ? "\(abs(Int8(bitPattern: state.dspReg(0x3C))))" : String(format: "%02X", state.dspReg(0x3C))
+        let mvolL = isDetailDecMode ? "\(abs(Int(Int8(bitPattern: state.dspReg(0x0C)))))" : String(format: "%02X", state.dspReg(0x0C))
+        let mvolR = isDetailDecMode ? "\(abs(Int(Int8(bitPattern: state.dspReg(0x1C)))))" : String(format: "%02X", state.dspReg(0x1C))
+        let evolL = isDetailDecMode ? "\(abs(Int(Int8(bitPattern: state.dspReg(0x2C)))))" : String(format: "%02X", state.dspReg(0x2C))
+        let evolR = isDetailDecMode ? "\(abs(Int(Int8(bitPattern: state.dspReg(0x3C)))))" : String(format: "%02X", state.dspReg(0x3C))
 
         "MVOL L: \(mvolL)  R: \(mvolR)     EVOL L: \(evolL)  R: \(evolR)".draw(at: CGPoint(x: 4, y: 18), withAttributes: textAttrs)
         "EDL Delay : \(state.dspReg(0x7D) & 0x0F) (\(Int(state.dspReg(0x7D) & 0x0F) * 16) ms)  EFB: \(Int8(bitPattern: state.dspReg(0x0D)))%".draw(at: CGPoint(x: 4, y: 32), withAttributes: textAttrs)
@@ -190,13 +199,16 @@ final class VisualizerView: NSView {
         ctx.strokeLineSegments(between: [CGPoint(x: 0, y: 15), CGPoint(x: 287, y: 15)])
 
         for i in 0..<8 {
-            let vl = isDetailDecMode ? abs(Int8(bitPattern: state.dspReg(i << 4 | 0x00))) : Int8(bitPattern: state.dspReg(i << 4 | 0x00))
-            let vr = isDetailDecMode ? abs(Int8(bitPattern: state.dspReg(i << 4 | 0x01))) : Int8(bitPattern: state.dspReg(i << 4 | 0x01))
+            let vlRaw = Int8(bitPattern: state.dspReg(i << 4 | 0x00))
+            let vrRaw = Int8(bitPattern: state.dspReg(i << 4 | 0x01))
+            let vlStr = isDetailDecMode ? String(format: "%3d", abs(Int(vlRaw))) : String(format: "%02X", UInt8(bitPattern: vlRaw))
+            let vrStr = isDetailDecMode ? String(format: "%3d", abs(Int(vrRaw))) : String(format: "%02X", UInt8(bitPattern: vrRaw))
+
             let pitch = UInt16(state.dspReg(i << 4 | 0x02)) | (UInt16(state.dspReg(i << 4 | 0x03)) << 8)
             let envx = state.envLevel(i)
-            let outx = abs(state.voiceOut(i)) >> 8
+            let outx = abs(Int32(state.voiceOut(i))) >> 8
 
-            let rowStr = String(format: "%d  |  %02X    %02X   %04X   %02X   %02X", i + 1, vl, vr, pitch, envx, outx)
+            let rowStr = String(format: "%d  |  %@    %@   %04X   %02X   %02X", i + 1, vlStr, vrStr, pitch, envx, outx)
             let color = envx > 0 ? NSColor(hex: "#00FF66") : NSColor(hex: "#666666")
             rowStr.draw(at: CGPoint(x: 4, y: CGFloat(16 + (i * 9))), withAttributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
@@ -351,11 +363,11 @@ final class VisualizerView: NSView {
         if viewMode == .indicator && clickX >= 135 && clickX <= 285 && clickY >= 20 && clickY <= 38 {
             if event.modifierFlags.contains(.shift) {
                 let ratio = max(0.0, min(1.0, (clickX - 140.0) / 140.0))
-                if let engine = engine { engine.setStartRepeatMark(to: ratio * engine.songDuration) }
+                if let engine = engine { engine.setStartRepeatMark(to: ratio * max(1.0, engine.songDuration)) }
             } else {
                 isScrubbing = true
                 scrubRatio = max(0.0, min(1.0, (clickX - 140.0) / 140.0))
-                if let engine = engine { engine.seek(to: scrubRatio * engine.songDuration) }
+                if let engine = engine { engine.seek(to: scrubRatio * max(1.0, engine.songDuration)) }
             }
             needsDisplay = true
         } else {
@@ -371,7 +383,7 @@ final class VisualizerView: NSView {
 
         if viewMode == .indicator && clickX >= 135 && clickX <= 285 && clickY >= 20 && clickY <= 38 {
             let ratio = max(0.0, min(1.0, (clickX - 140.0) / 140.0))
-            if let engine = engine { engine.setLimitRepeatMark(to: ratio * engine.songDuration) }
+            if let engine = engine { engine.setLimitRepeatMark(to: ratio * max(1.0, engine.songDuration)) }
             needsDisplay = true
         } else {
             isDetailDecMode.toggle()
@@ -390,7 +402,7 @@ final class VisualizerView: NSView {
     override func mouseUp(with event: NSEvent) {
         if isScrubbing {
             isScrubbing = false
-            if let engine = engine { engine.seek(to: scrubRatio * engine.songDuration) }
+            if let engine = engine { engine.seek(to: scrubRatio * max(1.0, engine.songDuration)) }
             needsDisplay = true
         }
     }
