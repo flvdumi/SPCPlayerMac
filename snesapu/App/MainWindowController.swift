@@ -1,4 +1,6 @@
+// [App/MainWindowController.swift]
 import Cocoa
+import UniformTypeIdentifiers
 
 final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableViewDelegate, NSTableViewDataSource, SpcEngineDelegate {
     private let engine = SpcEngine()
@@ -10,7 +12,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     private var visualizer: VisualizerView!
     private var playlistTable: NSTableView!
     private var playButton: NSButton!
+    private var pauseButton: NSButton!
     private var voiceButtons: [ChannelButton] = []
+    private var oscilloscopeController: OscilloscopeWindowController?
 
     // Submenu references
     private var rateSubmenu: NSMenu?
@@ -51,8 +55,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         setupMenu()
         setupTimer()
         setupKeyboardMonitor()
-
-        window.registerForDraggedTypes([.fileURL])
     }
 
     deinit {
@@ -60,15 +62,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         if let activity = appNapActivity { ProcessInfo.processInfo.endActivity(activity) }
         timer?.invalidate()
     }
+
     func playTrackFromURL(_ url: URL) {
-            if !playlistURLs.contains(url) {
-                playlistURLs.append(url)
-                playlistTable.reloadData()
-            }
-            if let idx = playlistURLs.firstIndex(of: url) {
-                playTrack(index: idx)
-            }
+        if !playlistURLs.contains(url) {
+            playlistURLs.append(url)
+            playlistTable.reloadData()
         }
+        if let idx = playlistURLs.firstIndex(of: url) {
+            playTrack(index: idx)
+        }
+    }
+
     private func setupUI() {
         guard let contentView = window?.contentView else { return }
         contentView.wantsLayer = true
@@ -80,14 +84,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         visualizer.engine = engine
         contentView.addSubview(visualizer)
 
-        // Transport Buttons
-        _ = createButton(title: "OPEN", x: 5, y: 103, w: 55, h: 21, action: #selector(openFileDialog))
-        _ = createButton(title: "SAVE", x: 62, y: 103, w: 55, h: 21, action: #selector(saveWavDialog))
-        playButton = createButton(title: "PLAY", x: 126, y: 103, w: 54, h: 21, action: #selector(togglePlayPause))
-        _ = createButton(title: "RESTART", x: 182, y: 103, w: 54, h: 21, action: #selector(restartPlayback))
-        _ = createButton(title: "STOP", x: 238, y: 103, w: 54, h: 21, action: #selector(stopPlayback))
+        // Transport Buttons Row 1 (y: 103)
 
-        // Channel Buttons 1..8
+                _ = createButton(title: "OPEN", x: 5, y: 103, w: 55, h: 21, action: #selector(openFileDialog))
+                _ = createButton(title: "SAVE", x: 62, y: 103, w: 55, h: 21, action: #selector(saveWavDialog))
+                playButton = createButton(title: "PLAY", x: 126, y: 103, w: 54, h: 21, action: #selector(togglePlayPause))
+                _ = createButton(title: "RESTART", x: 182, y: 103, w: 54, h: 21, action: #selector(restartPlayback))
+                _ = createButton(title: "STOP", x: 238, y: 103, w: 54, h: 21, action: #selector(stopPlayback))
+        // Channel Buttons 1..8 (y: 127)
         for i in 0..<8 {
             let btn = ChannelButton(frame: NSRect(x: CGFloat(5 + i * 14) * s,
                                                   y: contentView.bounds.height - CGFloat(127 + 21) * s,
@@ -103,15 +107,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             voiceButtons.append(btn)
         }
 
-        // Steppers & Seek Buttons
-        _ = createButton(title: "VL-", x: 126, y: 127, w: 26, h: 21) { [weak self] in self?.nudgeVolume(up: false) }
-        _ = createButton(title: "VL+", x: 154, y: 127, w: 26, h: 21) { [weak self] in self?.nudgeVolume(up: true) }
-        _ = createButton(title: "SP-", x: 182, y: 127, w: 26, h: 21) { [weak self] in self?.nudgeSpeed(up: false) }
-        _ = createButton(title: "SP+", x: 210, y: 127, w: 26, h: 21) { [weak self] in self?.nudgeSpeed(up: true) }
-        _ = createButton(title: "REW", x: 238, y: 127, w: 26, h: 21) { [weak self] in self?.seekStep(forward: false) }
-        _ = createButton(title: "FF",  x: 266, y: 127, w: 26, h: 21) { [weak self] in self?.seekStep(forward: true) }
+        // Steppers & Seek Buttons Row 2 (y: 127)
+        _ = createButton(title: "VL-", x: 126, y: 127, w: 26, h: 21, action: #selector(volumeDownAction))
+        _ = createButton(title: "VL+", x: 154, y: 127, w: 26, h: 21, action: #selector(volumeUpAction))
+        _ = createButton(title: "SP-", x: 182, y: 127, w: 26, h: 21, action: #selector(speedDownAction))
+        _ = createButton(title: "SP+", x: 210, y: 127, w: 26, h: 21, action: #selector(speedUpAction))
+        _ = createButton(title: "REW", x: 238, y: 127, w: 26, h: 21, action: #selector(rewindAction))
+        _ = createButton(title: "FF",  x: 266, y: 127, w: 26, h: 21, action: #selector(fastForwardAction))
 
-        // Playlist View
+        // Playlist View (x: 301..516)
         let scroll = NSScrollView(frame: NSRect(x: 301 * s, y: contentView.bounds.height - (124 * s), width: 215 * s, height: 122 * s))
         playlistTable = NSTableView(frame: scroll.bounds)
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(rawValue: "SPCFile"))
@@ -121,14 +125,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         playlistTable.dataSource = self
         playlistTable.doubleAction = #selector(onPlaylistDoubleClick)
         playlistTable.backgroundColor = NSColor(hex: "#111111")
+        playlistTable.registerForDraggedTypes([.fileURL])
         scroll.documentView = playlistTable
         contentView.addSubview(scroll)
 
         _ = createButton(title: "APPEND", x: 301, y: 127, w: 54, h: 21, action: #selector(openFileDialog))
         _ = createButton(title: "REMOVE", x: 357, y: 127, w: 54, h: 21, action: #selector(removeSelected))
         _ = createButton(title: "CLEAR",  x: 413, y: 127, w: 54, h: 21, action: #selector(clearPlaylist))
-        _ = createButton(title: "▲", x: 472, y: 127, w: 21, h: 21) { [weak self] in self?.movePlaylistItem(direction: -1) }
-        _ = createButton(title: "▼", x: 495, y: 127, w: 21, h: 21) { [weak self] in self?.movePlaylistItem(direction: 1) }
+        _ = createButton(title: "▲",      x: 472, y: 127, w: 21, h: 21, action: #selector(moveItemUpAction))
+        _ = createButton(title: "▼",      x: 495, y: 127, w: 21, h: 21, action: #selector(moveItemDownAction))
     }
 
     private func createButton(title: String, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, action: Selector? = nil) -> NSButton {
@@ -145,49 +150,73 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         return btn
     }
 
-    private func createButton(title: String, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat, handler: @escaping () -> Void) -> NSButton {
-        let btn = createButton(title: title, x: x, y: y, w: w, h: h)
-        btn.target = self
-        btn.action = #selector(buttonActionWrapper(_:))
-        objc_setAssociatedObject(btn, "btnHandlerClosure", handler, .OBJC_ASSOCIATION_COPY_NONATOMIC)
-        return btn
-    }
-
-    @objc private func buttonActionWrapper(_ sender: NSButton) {
-        if let block = objc_getAssociatedObject(sender, "btnHandlerClosure") as? () -> Void {
-            block()
-        }
-    }
-
     func spcEngineDidFinishTrack(_ engine: SpcEngine) {
         playNextTrack()
     }
 
+    // MARK: - Dedicated Action Handlers
+    @objc private func volumeDownAction()  { nudgeVolume(up: false) }
+    @objc private func volumeUpAction()    { nudgeVolume(up: true) }
+    @objc private func speedDownAction()   { nudgeSpeed(up: false) }
+    @objc private func speedUpAction()     { nudgeSpeed(up: true) }
+    @objc private func rewindAction()      { seekStep(forward: false) }
+    @objc private func fastForwardAction() { seekStep(forward: true) }
+    @objc private func moveItemUpAction()   { movePlaylistItem(direction: -1) }
+    @objc private func moveItemDownAction() { movePlaylistItem(direction: 1) }
+
+    @objc private func toggleOscilloscope() {
+        if oscilloscopeController == nil {
+            oscilloscopeController = OscilloscopeWindowController(engine: engine)
+        }
+        oscilloscopeController?.showWindow(nil)
+        oscilloscopeController?.window?.makeKeyAndOrderFront(nil)
+    }
+
     // MARK: - Transport Actions
-    @objc private func togglePlayPause() {
+    @objc private func playPlayback() {
         if !engine.isPlaying {
-            if let cur = engine.currentSpcURL { _ = engine.loadSPC(url: cur) }
-            else if !playlistURLs.isEmpty { playTrack(index: 0) }
-            playButton.title = "PAUSE"
+            if let cur = engine.currentSpcURL {
+                _ = engine.loadSPC(url: cur)
+            } else if !playlistURLs.isEmpty {
+                playTrack(index: 0)
+            }
         } else if engine.isPaused {
             engine.resume()
-            playButton.title = "PAUSE"
+        }
+    }
+
+    @objc private func pausePlayback() {
+        if engine.isPlaying {
+            if engine.isPaused {
+                engine.resume()
+            } else {
+                engine.pause()
+            }
+        }
+    }
+
+    @objc private func togglePlayPause() {
+        if !engine.isPlaying {
+            if let cur = engine.currentSpcURL {
+                _ = engine.loadSPC(url: cur)
+            } else if !playlistURLs.isEmpty {
+                playTrack(index: 0)
+            }
+        } else if engine.isPaused {
+            engine.resume()
         } else {
             engine.pause()
-            playButton.title = "PLAY"
         }
     }
 
     @objc private func restartPlayback() {
         if let url = engine.currentSpcURL {
             _ = engine.loadSPC(url: url)
-            playButton.title = "PAUSE"
         }
     }
 
     @objc private func stopPlayback() {
         engine.stop()
-        playButton.title = "PLAY"
     }
 
     private func toggleChannel(_ idx: Int) {
@@ -257,7 +286,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         playlistTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         playlistTable.scrollRowToVisible(index)
         _ = engine.loadSPC(url: playlistURLs[index])
-        playButton.title = "PAUSE"
         window?.title = "\(playlistURLs[index].lastPathComponent) - SNES SPC700 Player"
     }
 
@@ -289,10 +317,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     @objc private func openFileDialog() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = []
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "spc")].compactMap { $0 }
         if panel.runModal() == .OK {
             for url in panel.urls where url.pathExtension.lowercased() == "spc" {
-                playlistURLs.append(url)
+                if !playlistURLs.contains(url) {
+                    playlistURLs.append(url)
+                }
             }
             playlistTable.reloadData()
             if !engine.isPlaying, let first = playlistURLs.first {
@@ -303,14 +335,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
     @objc private func saveWavDialog() {
         guard engine.currentSpcURL != nil else { return }
+        guard let win = window else { return }
+
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "output.wav"
-        if panel.runModal() == .OK, let url = panel.url {
-            engine.exportWav(to: url)
+        panel.nameFieldStringValue = (engine.currentSpcURL?.deletingPathExtension().lastPathComponent ?? "output") + ".wav"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [.wav]
+
+        panel.beginSheetModal(for: win) { [weak self] response in
+            if response == .OK, let url = panel.url {
+                self?.engine.exportWav(to: url)
+            }
         }
     }
 
-    @objc private func onPlaylistDoubleClick() { playTrack(index: playlistTable.selectedRow) }
+    @objc private func onPlaylistDoubleClick() {
+        let row = playlistTable.selectedRow
+        if row >= 0 && row < playlistURLs.count {
+            playTrack(index: row)
+        }
+    }
 
     @objc private func removeSelected() {
         let row = playlistTable.selectedRow
@@ -322,7 +366,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
     @objc private func clearPlaylist() {
         engine.stop()
-        playButton.title = "PLAY"
         playlistURLs.removeAll()
         playlistTable.reloadData()
     }
@@ -367,6 +410,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         self.timer = t
     }
 
+    // MARK: - Table View Data Source & Drag and Drop
     func numberOfRows(in tableView: NSTableView) -> Int { playlistURLs.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -381,58 +425,81 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         return cell
     }
 
-    private func setupKeyboardMonitor() {
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self = self else { return event }
-                let chars = event.charactersIgnoringModifiers ?? ""
-                let isShift = event.modifierFlags.contains(.shift)
-                let isCtrl = event.modifierFlags.contains(.control)
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        return .copy
+    }
 
-                if chars == "[" {
-                    self.engine.pitchKeyShift = max(-6, self.engine.pitchKeyShift - 1)
-                    self.engine.applyAllParameters()
-                    self.flashTitle("Key Shift: \(self.engine.pitchKeyShift)")
-                    self.updateMenuCheckmarks()
-                    return nil
-                } else if chars == "]" {
-                    self.engine.pitchKeyShift = min(6, self.engine.pitchKeyShift + 1)
-                    self.engine.applyAllParameters()
-                    self.flashTitle("Key Shift: \(self.engine.pitchKeyShift)")
-                    self.updateMenuCheckmarks()
-                    return nil
-                }
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        guard let items = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return false }
+        let spcFiles = items.filter { $0.pathExtension.lowercased() == "spc" }
+        guard !spcFiles.isEmpty else { return false }
 
-                switch event.keyCode {
-                case 49: self.togglePlayPause(); return nil
-                case 18...21, 23, 22, 26, 28:
-                    let idx = (event.keyCode <= 23) ? Int(event.keyCode - 18) : (event.keyCode == 22 ? 5 : (event.keyCode == 26 ? 6 : 7))
-                    if isShift { self.soloChannel(idx) } else { self.toggleChannel(idx) }
-                    return nil
-                case 126: // Up Arrow = Volume Up
-                    self.nudgeVolume(up: true); return nil
-                case 125: // Down Arrow = Volume Down
-                    self.nudgeVolume(up: false); return nil
-                case 123: // Left Arrow = Seek Backward (or Speed with Ctrl)
-                    if isCtrl { self.nudgeSpeed(up: false) } else { self.seekStep(forward: false) }
-                    return nil
-                case 124: // Right Arrow = Seek Forward (or Speed with Ctrl)
-                    if isCtrl { self.nudgeSpeed(up: true) } else { self.seekStep(forward: true) }
-                    return nil
-                case 9:
-                    let nextMode = (self.visualizer.viewMode.rawValue + 1) % VisualizerView.ViewMode.allCases.count
-                    self.visualizer.viewMode = VisualizerView.ViewMode(rawValue: nextMode)!
-                    self.updateMenuCheckmarks()
-                    return nil
-                case 11:
-                    self.visualizer.isDetailDecMode.toggle()
-                    return nil
-                default:
-                    if chars.lowercased() == "r" { self.restartPlayback(); return nil }
-                    else if chars.lowercased() == "s" { self.stopPlayback(); return nil }
-                }
-                return event
-            }
+        let insertIndex = min(row, playlistURLs.count)
+        var addedCount = 0
+        for url in spcFiles where !playlistURLs.contains(url) {
+            playlistURLs.insert(url, at: insertIndex + addedCount)
+            addedCount += 1
         }
+        playlistTable.reloadData()
+        if !engine.isPlaying, let first = playlistURLs.first {
+            playTrack(index: 0)
+        }
+        return true
+    }
+
+    private func setupKeyboardMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            let chars = event.charactersIgnoringModifiers ?? ""
+            let isShift = event.modifierFlags.contains(.shift)
+            let isCtrl = event.modifierFlags.contains(.control)
+
+            if chars == "[" {
+                self.engine.pitchKeyShift = max(-6, self.engine.pitchKeyShift - 1)
+                self.engine.applyAllParameters()
+                self.flashTitle("Key Shift: \(self.engine.pitchKeyShift)")
+                self.updateMenuCheckmarks()
+                return nil
+            } else if chars == "]" {
+                self.engine.pitchKeyShift = min(6, self.engine.pitchKeyShift + 1)
+                self.engine.applyAllParameters()
+                self.flashTitle("Key Shift: \(self.engine.pitchKeyShift)")
+                self.updateMenuCheckmarks()
+                return nil
+            }
+
+            switch event.keyCode {
+            case 49: self.togglePlayPause(); return nil
+            case 18...21, 23, 22, 26, 28:
+                let idx = (event.keyCode <= 23) ? Int(event.keyCode - 18) : (event.keyCode == 22 ? 5 : (event.keyCode == 26 ? 6 : 7))
+                if isShift { self.soloChannel(idx) } else { self.toggleChannel(idx) }
+                return nil
+            case 126: // Up Arrow = Volume Up
+                self.nudgeVolume(up: true); return nil
+            case 125: // Down Arrow = Volume Down
+                self.nudgeVolume(up: false); return nil
+            case 123: // Left Arrow = Seek Backward (or Speed with Ctrl)
+                if isCtrl { self.nudgeSpeed(up: false) } else { self.seekStep(forward: false) }
+                return nil
+            case 124: // Right Arrow = Seek Forward (or Speed with Ctrl)
+                if isCtrl { self.nudgeSpeed(up: true) } else { self.seekStep(forward: true) }
+                return nil
+            case 9:
+                let nextMode = (self.visualizer.viewMode.rawValue + 1) % VisualizerView.ViewMode.allCases.count
+                self.visualizer.viewMode = VisualizerView.ViewMode(rawValue: nextMode)!
+                self.updateMenuCheckmarks()
+                return nil
+            case 11:
+                self.visualizer.isDetailDecMode.toggle()
+                return nil
+            default:
+                if chars.lowercased() == "r" { self.restartPlayback(); return nil }
+                else if chars.lowercased() == "s" { self.stopPlayback(); return nil }
+                else if chars.lowercased() == "k" { self.toggleOscilloscope(); return nil }
+            }
+            return event
+        }
+    }
 
     private func setupMenu() {
         let mainMenu = NSMenu()
@@ -443,8 +510,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         fileMenu.addItem(withTitle: "Open SPC File...", action: #selector(openFileDialog), keyEquivalent: "o")
         fileMenu.addItem(withTitle: "Export WAV...", action: #selector(saveWavDialog), keyEquivalent: "s")
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Play", action: #selector(togglePlayPause), keyEquivalent: "x")
-        fileMenu.addItem(withTitle: "Pause", action: #selector(togglePlayPause), keyEquivalent: "c")
+        fileMenu.addItem(withTitle: "Oscilloscope...", action: #selector(toggleOscilloscope), keyEquivalent: "k")
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(withTitle: "Play / Pause", action: #selector(togglePlayPause), keyEquivalent: "x")
         fileMenu.addItem(withTitle: "Restart", action: #selector(restartPlayback), keyEquivalent: "r")
         fileMenu.addItem(withTitle: "Stop", action: #selector(stopPlayback), keyEquivalent: "t")
         fileMenuItem.submenu = fileMenu
@@ -453,6 +521,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         // 2. Settings Menu
         let settingsMenuItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         let settingsMenu = NSMenu(title: "Settings")
+
+        // Prominently exposed Oscilloscope item in Settings
+        let scopeItem = NSMenuItem(title: "Oscilloscope (8 Channels)...", action: #selector(toggleOscilloscope), keyEquivalent: "k")
+        scopeItem.target = self
+        settingsMenu.addItem(scopeItem)
+        settingsMenu.addItem(.separator())
 
         // Channels
         let chSub = NSMenu(title: "Channels")
@@ -583,6 +657,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             item.tag = pct
             spdSub.addItem(item)
         }
+        let syncItem = NSMenuItem(title: "Sync Pitch to Speed (Vinyl Mode)", action: #selector(togglePitchSyncSpeed), keyEquivalent: "")
+        syncItem.target = self
+        spdSub.addItem(.separator())
+        spdSub.addItem(syncItem)
         self.speedSubmenu = spdSub
         let spdItem = NSMenuItem(title: "Playback Speed", action: nil, keyEquivalent: "")
         spdItem.submenu = spdSub
@@ -747,7 +825,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             (5, "Channel 4 (Source & Directory)"),
             (6, "SPC Tags 1 (Metadata)"),
             (7, "SPC Tags 2 (Registers)"),
-            (8, "Script700 Debug")
+            (8, "Script700 Debug"),
+            (9, "Oscilloscope (8 Channels)")
         ] {
             let item = NSMenuItem(title: name, action: #selector(viewModeMenuSelected(_:)), keyEquivalent: "")
             item.target = self
@@ -786,21 +865,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
     }
 
     // MARK: - Menu Actions
-        @objc private func channelMenuSelected(_ sender: NSMenuItem) {
-            engine.isMono = (sender.tag == 1)
-            engine.applyAllParameters() // Seamlessly toggles mono inside C++ DSP
-            updateMenuCheckmarks()
-        }
+    @objc private func channelMenuSelected(_ sender: NSMenuItem) {
+        engine.isMono = (sender.tag == 1)
+        engine.applyAllParameters()
+        updateMenuCheckmarks()
+    }
 
-  
     @objc private func bitMenuSelected(_ sender: NSMenuItem) {
-        engine.targetBitDepth = sender.tag
+        engine.setBitDepth(sender.tag)
+        flashTitle("Bit: \(sender.title)")
         updateMenuCheckmarks()
     }
 
     @objc private func rateMenuSelected(_ sender: NSMenuItem) {
-        engine.targetSampleRate = Double(sender.tag)
-        flashTitle("Export Rate: \(sender.tag) Hz")
+        engine.setSampleRate(Double(sender.tag))
+        flashTitle("Rate: \(sender.tag) Hz")
         updateMenuCheckmarks()
     }
 
@@ -847,6 +926,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         updateMenuCheckmarks()
     }
 
+    @objc private func togglePitchSyncSpeed() {
+        engine.pitchSyncSpeed.toggle()
+        engine.applyAllParameters()
+        flashTitle("Pitch Sync: \(engine.pitchSyncSpeed ? "ON" : "OFF")")
+        updateMenuCheckmarks()
+    }
+
     @objc private func volumeMenuSelected(_ sender: NSMenuItem) {
         engine.currentAmp = Float(sender.tag) / 100.0
         engine.applyAllParameters()
@@ -856,7 +942,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
     @objc private func toggleChannelMenuSelected(_ sender: NSMenuItem) { toggleChannel(sender.tag) }
     @objc private func unmuteAllChannels() { engine.channelMuteMask = 0x00; engine.applyAllParameters(); updateChannelButtons(); updateMenuCheckmarks() }
-    @objc private func muteAllChannels() { engine.channelMuteMask = 0xFF; engine.applyAllParameters(); updateChannelButtons(); updateMenuCheckmarks() }
+    @objc private func muteAllChannels()   { engine.channelMuteMask = 0xFF; engine.applyAllParameters(); updateChannelButtons(); updateMenuCheckmarks() }
     @objc private func invertMuteChannels() { engine.channelMuteMask ^= 0xFF; engine.applyAllParameters(); updateChannelButtons(); updateMenuCheckmarks() }
 
     @objc private func toggleNoiseMenuSelected(_ sender: NSMenuItem) {
@@ -864,7 +950,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         engine.applyAllParameters()
         updateMenuCheckmarks()
     }
-    @objc private func enableAllNoise() { engine.channelNoiseMask = 0xFF; engine.applyAllParameters(); updateMenuCheckmarks() }
+    @objc private func enableAllNoise()  { engine.channelNoiseMask = 0xFF; engine.applyAllParameters(); updateMenuCheckmarks() }
     @objc private func disableAllNoise() { engine.channelNoiseMask = 0x00; engine.applyAllParameters(); updateMenuCheckmarks() }
 
     @objc private func playTimeModeSelected(_ sender: NSMenuItem) {
@@ -894,7 +980,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
         engine.seekTimeStep = Double(sender.tag)
         updateMenuCheckmarks()
     }
-    @objc private func toggleFastSeek() { engine.isSeekFast.toggle(); updateMenuCheckmarks() }
+    @objc private func toggleFastSeek()  { engine.isSeekFast.toggle(); updateMenuCheckmarks() }
     @objc private func toggleAsyncSeek() { engine.isSeekAsync.toggle(); updateMenuCheckmarks() }
 
     @objc private func viewModeMenuSelected(_ sender: NSMenuItem) {
@@ -948,7 +1034,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
             for item in items { item.state = (abs(Int(engine.feedbackValue) - item.tag) < 500) ? .on : .off }
         }
         if let items = speedSubmenu?.items {
-            for item in items { item.state = (item.tag == Int(round(engine.currentSpeed * 100))) ? .on : .off }
+            for item in items {
+                if item.tag > 0 { item.state = (item.tag == Int(round(engine.currentSpeed * 100))) ? .on : .off }
+                else if item.title.starts(with: "Sync") { item.state = engine.pitchSyncSpeed ? .on : .off }
+            }
         }
         if let items = volumeSubmenu?.items {
             for item in items { item.state = (item.tag == Int(round(engine.currentAmp * 100))) ? .on : .off }
@@ -991,19 +1080,4 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
     @objc private func nextTrackAction() { playNextTrack() }
     @objc private func prevTrackAction() { playPreviousTrack() }
-}
-
-extension NSColor {
-    convenience init(hex: String) {
-        var cString = hex.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        if cString.hasPrefix("#") { cString.remove(at: cString.startIndex) }
-        var rgbValue: UInt64 = 0
-        Scanner(string: cString).scanHexInt64(&rgbValue)
-        self.init(
-            red: CGFloat((rgbValue & 0xFF0000) >> 16) / 255.0,
-            green: CGFloat((rgbValue & 0x00FF00) >> 8) / 255.0,
-            blue: CGFloat(rgbValue & 0x0000FF) / 255.0,
-            alpha: 1.0
-        )
-    }
 }

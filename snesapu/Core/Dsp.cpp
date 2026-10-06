@@ -1,6 +1,10 @@
 #include "Dsp.hpp"
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+
+bool Dsp::tables_initialized = false;
+int16_t Dsp::CUBIC_TABLE[1024] = {0};
 
 const uint32_t Dsp::RATE_TABLE[32] = {
     0,
@@ -79,16 +83,41 @@ const int16_t Dsp::GAUSS_TABLE[1024] = {
        0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0
 };
 
+void Dsp::init_tables() {
+    if (tables_initialized) return;
+
+    // Build cubic table matching InitDSP .NextC loop
+    for (int d = 0; d < 256; ++d) {
+        double x1 = d / 256.0;
+        double x2 = x1 * x1;
+        double x3 = x2 * x1;
+
+        double c_m1 = -0.5 * x3 + 1.0 * x2 - 0.5 * x1;
+        double c_0  =  1.5 * x3 - 2.5 * x2 + 1.0;
+        double c_1  = -1.5 * x3 + 2.0 * x2 + 0.5 * x1;
+        double c_2  =  0.5 * x3 - 0.5 * x2;
+
+        CUBIC_TABLE[d * 4 + 0] = static_cast<int16_t>(std::round(c_m1 * 32767.0));
+        CUBIC_TABLE[d * 4 + 1] = static_cast<int16_t>(std::round(c_0  * 32767.0));
+        CUBIC_TABLE[d * 4 + 2] = static_cast<int16_t>(std::round(c_1  * 32767.0));
+        CUBIC_TABLE[d * 4 + 3] = static_cast<int16_t>(std::round(c_2  * 32767.0));
+    }
+
+    tables_initialized = true;
+}
+
 Dsp::Dsp() {
-    aaf1.init(8000.0f, 32000.0f);
-    aaf2.init(12000.0f, 32000.0f);
+    init_tables();
     reset();
 }
 
 void Dsp::reset() {
     std::memset(&regs, 0, sizeof(regs));
-    regs.raw[0x6C] = 0xE0;
-
+    regs.raw[0x6C] = 0xE0; // Power-up mode
+    for (auto& buf : voice_scope_buf) {
+        buf.fill(0);
+    }
+    scope_write_ptr = 0;
     for (auto& v : voices) {
         v = VoiceChannel{};
         v.flags.inactive = true;
@@ -118,14 +147,14 @@ void Dsp::reset() {
     dsp_options          = 0x01 | 0x800;
     inter_mode           = InterpolationMode::Gauss;
 
-    noise_period  = 0;
-    noise_counter = 0;
-    noise_lfsr    = 0x4000;
-    noise_sample  = 0;
+    noise_rate = 0;
+    noise_acc  = 0;
+    noise_seed = 1;
+    noise_sample = 0;
 
-    aaf1.reset();
-    aaf2.reset();
-    bass.reset();
+    aaf.init(32000.0f);
+    bass.init(32000.0f);
+    
 }
 
 void Dsp::set_stereo_separation(uint32_t sep) {
@@ -152,6 +181,7 @@ void Dsp::update_echo_feedback() {
 
 uint8_t Dsp::read_reg(uint8_t reg) {
     reg &= 0x7F;
+    if (reg == 0x4C) return 0x00; // Key-On always reads 0 on real hardware
     return regs.raw[reg];
 }
 
@@ -175,12 +205,14 @@ void Dsp::write_reg(uint8_t reg, uint8_t val) {
                 break;
             case 0x02: case 0x03: {
                 uint16_t p = regs.raw[(v_idx << 4) | 2] | (regs.raw[(v_idx << 4) | 3] << 8);
-                v.original_pitch = (p & 0x3FFF) << 4;
-                // If 0x40 (DSP_NOPREAD: Disable Pitch Bend) is set and voice is active, keep latched pitch
+                v.original_pitch = (dsp_options & 0x04) ? p : (p & 0x3FFF);
                 if (!(dsp_options & 0x40) || v.flags.inactive) {
                     v.latched_pitch = v.original_pitch;
                 }
-                v.pitch_rate = static_cast<uint32_t>(v.latched_pitch * get_total_pitch_multiplier());
+                uint32_t p_adj = static_cast<uint32_t>((static_cast<uint64_t>(pitch_base_hz) << 20) / 32000);
+                uint64_t product = static_cast<uint64_t>(v.latched_pitch) * p_adj;
+                uint32_t rounded = static_cast<uint32_t>((product >> 16) + ((product >> 15) & 1));
+                v.pitch_rate = static_cast<uint32_t>(rounded * key_shift_multiplier * (pitch_sync_speed ? speed_multiplier : 1.0f));
                 break;
             }
             case 0x04: break; // SRCN
@@ -211,10 +243,16 @@ void Dsp::write_reg(uint8_t reg, uint8_t val) {
                 if (echo_ram_ptr >= echo_length) echo_ram_ptr = 0;
                 break;
             }
-            case 0x6C: {
+            case 0x6C: { // FLG
                 uint8_t n_val = val & 0x1F;
-                noise_period = RATE_TABLE[n_val];
-                noise_counter = noise_period;
+                if (n_val == 0) {
+                    noise_rate = 0;
+                } else {
+                    uint32_t rate_val = RATE_TABLE[n_val] << 16;
+                    uint64_t num = (static_cast<uint64_t>(65535) << 32) | 0xFFFFFFFFULL;
+                    noise_rate = static_cast<uint32_t>(num / rate_val);
+                }
+
                 if (val & 0x80) { // Soft Reset
                     for (auto& v : voices) {
                         v.flags.inactive = true;
@@ -225,7 +263,7 @@ void Dsp::write_reg(uint8_t reg, uint8_t val) {
                 }
                 break;
             }
-            case 0x7C: regs.raw[0x7C] = 0; break;
+            case 0x7C: regs.raw[0x7C] = 0; break; // Clear ENDX
         }
     }
 }
@@ -238,46 +276,30 @@ void Dsp::recalc_adsr(int v_idx) {
     uint8_t adsr2 = regs.raw[(v_idx << 4) | 6];
 
     if (adsr1 & 0x80) {
-        if (v.env_mode != EnvelopeMode::Att &&
-            v.env_mode != EnvelopeMode::Decay &&
-            v.env_mode != EnvelopeMode::Sust) {
-            v.env_mode = EnvelopeMode::Att;
-            v.env_dest = 2047;
-            v.env_idle = false;
-        }
-
         if (v.env_mode == EnvelopeMode::Att) {
             uint8_t ar = adsr1 & 0x0F;
             v.env_rate = RATE_TABLE[ar * 2 + 1];
             v.env_counter = v.env_rate;
-            if (ar == 15) {
-                v.env_val = 2047;
-                v.env_mode = EnvelopeMode::Decay;
-                uint8_t dr = (adsr1 >> 4) & 7;
-                v.env_rate = RATE_TABLE[dr * 2 + 16];
-                v.env_counter = v.env_rate;
-                int sl = (adsr2 >> 5) + 1;
-                v.env_dest = (sl * 2048) / 8 - 1;
-            }
+            v.env_adj = (ar == 15) ? 2047 : 32;
         } else if (v.env_mode == EnvelopeMode::Decay) {
             uint8_t dr = (adsr1 >> 4) & 7;
             v.env_rate = RATE_TABLE[dr * 2 + 16];
             v.env_counter = v.env_rate;
             int sl = (adsr2 >> 5) + 1;
-            v.env_dest = (sl * 2048) / 8 - 1;
-            if (v.env_val <= v.env_dest) {
-                v.env_mode = EnvelopeMode::Sust;
-                uint8_t sr = adsr2 & 0x1F;
-                v.env_rate = RATE_TABLE[sr];
-                v.env_counter = v.env_rate;
+            int32_t new_dest = (sl * 2048) / 8 - 1;
+
+            // ASM ChgDec: if new sustain level is higher than current envelope,
+            // continue decaying towards 0 without premature transition
+            if (v.env_val < new_dest) {
                 v.env_dest = 0;
-                v.env_idle = (sr == 0);
+            } else {
+                v.env_dest = new_dest;
             }
         } else if (v.env_mode == EnvelopeMode::Sust) {
             uint8_t sr = adsr2 & 0x1F;
             v.env_rate = RATE_TABLE[sr];
             v.env_counter = v.env_rate;
-            v.env_idle = (sr == 0);
+            v.env_idle = (sr == 0 || v.env_val <= 0);
         }
     } else {
         recalc_gain(v_idx);
@@ -294,9 +316,12 @@ void Dsp::recalc_gain(int v_idx) {
     uint8_t gain = regs.raw[(v_idx << 4) | 7];
     if ((gain & 0x80) == 0) {
         uint8_t direct = gain & 0x7F;
-        v.env_val = (direct << 4) + (direct >> 3);
+        v.env_dest = (direct << 4) + (direct >> 3);
+        v.env_adj = 2047;
         v.env_mode = EnvelopeMode::Direct;
-        v.env_idle = true;
+        v.env_rate = RATE_TABLE[31];
+        v.env_counter = v.env_rate;
+        v.env_idle = false;
     } else {
         uint8_t rate_idx = gain & 0x1F;
         v.env_rate = RATE_TABLE[rate_idx];
@@ -304,10 +329,10 @@ void Dsp::recalc_gain(int v_idx) {
         v.env_idle = (rate_idx == 0);
 
         uint8_t mode = (gain >> 5) & 3;
-        if (mode == 0)      { v.env_mode = EnvelopeMode::Dec;  v.env_dest = 0; }
-        else if (mode == 1) { v.env_mode = EnvelopeMode::Exp;  v.env_dest = 0; }
-        else if (mode == 2) { v.env_mode = EnvelopeMode::Inc;  v.env_dest = 2047; }
-        else                { v.env_mode = EnvelopeMode::Bent; v.env_dest = 1536; }
+        if (mode == 0)      { v.env_mode = EnvelopeMode::Dec;  v.env_dest = 0;    v.env_adj = 32; }
+        else if (mode == 1) { v.env_mode = EnvelopeMode::Exp;  v.env_dest = 0;    v.env_adj = 0;  }
+        else if (mode == 2) { v.env_mode = EnvelopeMode::Inc;  v.env_dest = 2047; v.env_adj = 32; }
+        else                { v.env_mode = EnvelopeMode::Bent; v.env_dest = 1536; v.env_adj = 32; }
     }
 }
 
@@ -327,9 +352,13 @@ void Dsp::key_on_voice(int i) {
     v.current_vol_r = v.target_vol_r;
 
     uint16_t p = regs.raw[(i << 4) | 2] | (regs.raw[(i << 4) | 3] << 8);
-    v.original_pitch = (p & 0x3FFF) << 4;
+    v.original_pitch = (dsp_options & 0x04) ? p : (p & 0x3FFF);
     v.latched_pitch  = v.original_pitch;
-    v.pitch_rate     = static_cast<uint32_t>(v.latched_pitch * get_total_pitch_multiplier());
+
+    uint32_t p_adj = static_cast<uint32_t>((static_cast<uint64_t>(pitch_base_hz) << 20) / 32000);
+    uint64_t product = static_cast<uint64_t>(v.latched_pitch) * p_adj;
+    uint32_t rounded = static_cast<uint32_t>((product >> 16) + ((product >> 15) & 1));
+    v.pitch_rate = static_cast<uint32_t>(rounded * key_shift_multiplier * (pitch_sync_speed ? speed_multiplier : 1.0f));
 
     uint8_t src = regs.raw[(i << 4) | 4];
     v.srcn = src;
@@ -339,37 +368,34 @@ void Dsp::key_on_voice(int i) {
     v.pitch_dec = 0;
     v.prev1 = 0;
     v.prev2 = 0;
-    std::memset(v.sample_buf, 0, sizeof(v.sample_buf));
+
+    // Reset history buffer (samples 0..3) to 0
+    std::fill(v.sample_buf.begin(), v.sample_buf.begin() + 4, static_cast<int16_t>(0));
+
+    // Envelope initialization matching StartEnv: envelope starts at 0 unconditionally
+    v.env_val = 0;
 
     uint8_t adsr1 = v.saved_adsr & 0xFF;
     uint8_t adsr2 = (v.saved_adsr >> 8) & 0xFF;
     uint8_t gain  = v.saved_gain;
 
     if (adsr1 & 0x80) {
-        v.env_val = 0;
         uint8_t ar = adsr1 & 0x0F;
-        if (ar == 15) {
-            v.env_val = 2047;
-            v.env_mode = EnvelopeMode::Decay;
-            uint8_t dr = (adsr1 >> 4) & 7;
-            v.env_rate = RATE_TABLE[dr * 2 + 16];
-            v.env_counter = v.env_rate;
-            int sl = (adsr2 >> 5) + 1;
-            v.env_dest = (sl * 2048) / 8 - 1;
-            v.env_idle = false;
-        } else {
-            v.env_mode = EnvelopeMode::Att;
-            v.env_idle = false;
-            v.env_dest = 2047;
-            v.env_rate = RATE_TABLE[ar * 2 + 1];
-            v.env_counter = v.env_rate;
-        }
+        v.env_mode = EnvelopeMode::Att;
+        v.env_dest = 2047;
+        v.env_rate = RATE_TABLE[ar * 2 + 1];
+        v.env_counter = v.env_rate;
+        v.env_adj = (ar == 15) ? 2047 : 32;
+        v.env_idle = false;
     } else {
         if ((gain & 0x80) == 0) {
             uint8_t direct = gain & 0x7F;
-            v.env_val = (direct << 4) + (direct >> 3);
+            v.env_dest = (direct << 4) + (direct >> 3);
+            v.env_adj = 2047;
             v.env_mode = EnvelopeMode::Direct;
-            v.env_idle = true;
+            v.env_rate = RATE_TABLE[31];
+            v.env_counter = v.env_rate;
+            v.env_idle = false;
         } else {
             uint8_t mode = (gain >> 5) & 3;
             uint8_t rate_idx = gain & 0x1F;
@@ -377,25 +403,18 @@ void Dsp::key_on_voice(int i) {
             v.env_counter = v.env_rate;
             v.env_idle = (rate_idx == 0);
 
-            if (mode == 0) { 
-                v.env_mode = EnvelopeMode::Dec;  v.env_dest = 0; v.env_val = 2047;
-            } else if (mode == 1) { 
-                v.env_mode = EnvelopeMode::Exp;  v.env_dest = 0; v.env_val = 2047;
-            } else if (mode == 2) { 
-                v.env_mode = EnvelopeMode::Inc;  v.env_dest = 2047; v.env_val = 0;
-            } else { 
-                v.env_mode = EnvelopeMode::Bent; v.env_dest = 1536; v.env_val = 0;
-            }
+            // In Gain mode, initial env_val is ALWAYS 0 in DSP.asm StartEnv
+            if (mode == 0)      { v.env_mode = EnvelopeMode::Dec;  v.env_dest = 0;    v.env_adj = 32; }
+            else if (mode == 1) { v.env_mode = EnvelopeMode::Exp;  v.env_dest = 0;    v.env_adj = 0;  }
+            else if (mode == 2) { v.env_mode = EnvelopeMode::Inc;  v.env_dest = 2047; v.env_adj = 32; }
+            else                { v.env_mode = EnvelopeMode::Bent; v.env_dest = 1536; v.env_adj = 32; }
         }
     }
 
     decode_brr_block(v);
 
-    v.prev_samples[0] = v.sample_buf[0];
-    v.prev_samples[1] = v.sample_buf[0];
-    v.prev_samples[2] = v.sample_buf[0];
-    v.prev_samples[3] = v.sample_buf[0];
-    v.sample_index = 0;
+    // Initial 4-point window begins after advancing 3 samples (sample index 3)
+    v.sample_index = 3;
 
     regs.raw[0x7C] &= ~(1 << i);
 }
@@ -410,67 +429,105 @@ void Dsp::key_off(uint8_t mask) {
                 v.env_rate = RATE_TABLE[31];
                 v.env_counter = v.env_rate;
                 v.env_dest = 0;
+                v.env_adj = 8;
                 v.env_idle = false;
             }
         }
     }
 }
 
+// 17-bit clamping with wrap matching DSP.asm UnpckClamp
+static inline int32_t brr_clamp17(int32_t eax) {
+    int32_t eax_clamped = eax + 65536;
+    int32_t sar17 = eax_clamped >> 17;
+    if (sar17 == 0) {
+        // Natural 16-bit wrap-around (MovSX EDX, AX)
+        int16_t ax = static_cast<int16_t>(eax & 0xFFFF);
+        return static_cast<int32_t>(ax);
+    }
+    // 17-bit overflow: if negative (underflow) return 0, else return -2
+    return (sar17 < 0) ? 0 : -2;
+}
+
 void Dsp::decode_brr_block(VoiceChannel& v) {
     if (!apu_ram) return;
 
-    std::memcpy(v.prev_samples, &v.sample_buf[12], 4 * sizeof(int16_t));
+    // Shift previous block's samples 12..15 to history slots 0..3
+    std::copy(v.sample_buf.begin() + 16, v.sample_buf.begin() + 20, v.sample_buf.begin());
 
     uint8_t header = apu_ram[v.brr_addr++];
     v.brr_header = header;
 
     int range = header >> 4;
     int filter = (header >> 2) & 3;
-    bool is_old_decoder = (dsp_options & 0x02) != 0; // 0x02: Old ADPCM Decoder
+    bool is_old_decoder = (dsp_options & 0x02) != 0;
+
+    int32_t p1 = v.prev1;
+    int32_t p2 = v.prev2;
 
     for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
         uint8_t data = apu_ram[v.brr_addr++];
 
         for (int nybble_idx = 0; nybble_idx < 2; ++nybble_idx) {
-            int32_t delta = (nybble_idx == 0) ? (data >> 4) : (data & 0x0F);
-            if (delta >= 8) delta -= 16;
+            uint8_t raw_n = (nybble_idx == 0) ? (data >> 4) : (data & 0x0F);
+            int32_t signed_n = (raw_n >= 8) ? (static_cast<int32_t>(raw_n) - 16) : static_cast<int32_t>(raw_n);
 
-            if (range <= 12) {
-                delta = (delta << range) >> 1;
-            } else {
-                delta = (delta < 0) ? -2048 : 0;
-            }
-
-            int32_t s = delta;
-            int32_t p1 = v.prev1;
-            int32_t p2 = v.prev2;
+            int32_t s = 0;
 
             if (is_old_decoder) {
-                // Classic unclipped BRR filter
-                switch (filter) {
-                    case 0: break;
-                    case 1: s += p1 + (-p1 >> 4); break;
-                    case 2: s += (p1 * 2) + ((-3 * p1) >> 5) - p2 + (p2 >> 4); break;
-                    case 3: s += (p1 * 2) + ((-13 * p1) >> 6) - p2 + ((p2 * 3) >> 4); break;
+                // DSP.asm UnpckSrcOld 6-bit fixed-point algorithm
+                int shift = (range <= 12) ? (12 - range) : 0;
+                if (filter == 0) {
+                    s = signed_n << range;
+                } else {
+                    int32_t delta = (signed_n << (6 + range));
+                    if (filter == 1) {
+                        s = (delta + p1 * 60) >> 6;
+                    } else if (filter == 2) {
+                        s = (delta - p2 * 60 + p1 * 122) >> 6;
+                    } else {
+                        s = (delta - p2 * 52 + p1 * 115) >> 6;
+                    }
                 }
+                s = static_cast<int16_t>(s) & ~1;
             } else {
-                // Authentic SNES S-DSP clamped arithmetic
+                // DSP.asm authentic brrTab expansion
+                int32_t delta = 0;
+                if (range <= 12) {
+                    delta = (signed_n << range) & ~1;
+                } else {
+                    delta = (signed_n < 0) ? -4096 : 0;
+                }
+
+                s = delta;
                 switch (filter) {
-                    case 0: break;
-                    case 1: s += p1 + ((-p1 >> 4) & ~1); break;
-                    case 2: s += (p1 * 2) + (((-3 * p1) >> 5) & ~1) - p2 + ((p2 >> 4) & ~1); break;
-                    case 3: s += (p1 * 2) + (((-13 * p1) >> 6) & ~1) - p2 + (((p2 * 3) >> 4) & ~1); break;
+                    case 0:
+                        s = delta;
+                        break;
+                    case 1:
+                        s += p1 + ((-p1 >> 4) & ~1);
+                        s = brr_clamp17(s);
+                        break;
+                    case 2:
+                        s += (p1 * 2) + (((-3 * p1) >> 5) & ~1) - p2 + ((p2 >> 4) & ~1);
+                        s = brr_clamp17(s);
+                        break;
+                    case 3:
+                        s += (p1 * 2) + (((-13 * p1) >> 6) & ~1) - p2 + (((p2 * 3) >> 4) & ~1);
+                        s = brr_clamp17(s);
+                        break;
                 }
             }
 
-            s = std::clamp<int32_t>(s, -32768, 32767);
             int16_t out_s = static_cast<int16_t>(s) & ~1;
-
-            v.sample_buf[byte_idx * 2 + nybble_idx] = out_s;
-            v.prev2 = v.prev1;
-            v.prev1 = out_s;
+            v.sample_buf[4 + byte_idx * 2 + nybble_idx] = out_s;
+            p2 = p1;
+            p1 = out_s;
         }
     }
+
+    v.prev1 = static_cast<int16_t>(p1);
+    v.prev2 = static_cast<int16_t>(p2);
 
     if (header & 0x01) {
         int v_idx = static_cast<int>(&v - &voices[0]);
@@ -499,7 +556,7 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
 
     switch (v.env_mode) {
         case EnvelopeMode::Att: {
-            val += 32;
+            val += v.env_adj;
             if (val >= 2047) {
                 val = 2047;
                 v.env_mode = EnvelopeMode::Decay;
@@ -512,7 +569,7 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
             break;
         }
         case EnvelopeMode::Decay: {
-            val -= ((val - 1) >> 8) + 1;
+            val += (-val >> 8);
             if (val <= v.env_dest) {
                 val = v.env_dest;
                 v.env_mode = EnvelopeMode::Sust;
@@ -520,12 +577,12 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
                 v.env_rate = RATE_TABLE[sr];
                 v.env_counter = v.env_rate;
                 v.env_dest = 0;
-                v.env_idle = (sr == 0);
+                v.env_idle = (sr == 0 || val <= 0);
             }
             break;
         }
         case EnvelopeMode::Sust: {
-            val -= ((val - 1) >> 8) + 1;
+            val += (-val >> 8);
             if (val <= 0) { val = 0; v.env_idle = true; }
             break;
         }
@@ -540,8 +597,13 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
             break;
         }
         case EnvelopeMode::Bent: {
-            val += (val < 1536) ? 32 : 8;
-            if (val >= 2047) { val = 2047; v.env_idle = true; }
+            if (val < 1536) {
+                val += 32;
+                if (val >= 1536) val = 1536; // Clamps to 1536 exactly
+            } else {
+                val += 8;
+                if (val >= 2047) { val = 2047; v.env_idle = true; }
+            }
             break;
         }
         case EnvelopeMode::Dec: {
@@ -550,12 +612,20 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
             break;
         }
         case EnvelopeMode::Exp: {
-            val -= ((val - 1) >> 8) + 1;
+            val += (-val >> 8);
             if (val <= 0) { val = 0; v.env_idle = true; }
             break;
         }
         case EnvelopeMode::Direct: {
-            v.env_idle = true;
+            if (val < v.env_dest) {
+                val += v.env_adj;
+                if (val >= v.env_dest) { val = v.env_dest; v.env_idle = true; }
+            } else if (val > v.env_dest) {
+                val -= v.env_adj;
+                if (val <= v.env_dest) { val = v.env_dest; v.env_idle = true; }
+            } else {
+                v.env_idle = true;
+            }
             break;
         }
     }
@@ -565,51 +635,58 @@ void Dsp::update_envelope(VoiceChannel& v, int v_idx) {
 
 int16_t Dsp::interpolate_sample(const VoiceChannel& v) {
     int idx = v.sample_index;
-    int16_t s0 = (idx >= 2) ? v.sample_buf[idx - 2] : v.prev_samples[idx + 2];
-    int16_t s1 = (idx >= 1) ? v.sample_buf[idx - 1] : v.prev_samples[idx + 3];
-    int16_t s2 = v.sample_buf[idx];
-    int16_t s3 = (idx + 1 < 16) ? v.sample_buf[idx + 1] : v.sample_buf[15]; 
+
+    // The 4-sample window: s0 (oldest) .. s3 (newest)
+    int16_t s0 = v.sample_buf[idx + 0];
+    int16_t s1 = v.sample_buf[idx + 1];
+    int16_t s2 = v.sample_buf[idx + 2];
+    int16_t s3 = v.sample_buf[idx + 3];
+
     float frac = (v.pitch_dec & 0xFFFF) / 65536.0f;
 
     switch (inter_mode) {
         case InterpolationMode::None:
-            return s1;
+            return s3;
 
         case InterpolationMode::Linear: {
-            float out = s1 + (s2 - s1) * frac;
-            return static_cast<int16_t>(std::clamp(out, -32768.0f, 32767.0f));
+            float out = s2 + (s3 - s2) * frac;
+            return static_cast<int16_t>(std::clamp(out, -32768.0f, 32767.0f)) & ~1;
         }
 
         case InterpolationMode::Cubic: {
-            float a = -0.5f * s0 + 1.5f * s1 - 1.5f * s2 + 0.5f * s3;
-            float b = s0 - 2.5f * s1 + 2.0f * s2 - 0.5f * s3;
-            float c = -0.5f * s0 + 0.5f * s2;
-            float d = s1;
-            float out = ((a * frac + b) * frac + c) * frac + d;
-            return static_cast<int16_t>(std::clamp(out, -32768.0f, 32767.0f));
+            int f_idx = (v.pitch_dec >> 8) & 0xFF;
+            int32_t out = (s0 * CUBIC_TABLE[f_idx * 4 + 0] +
+                           s1 * CUBIC_TABLE[f_idx * 4 + 1] +
+                           s2 * CUBIC_TABLE[f_idx * 4 + 2] +
+                           s3 * CUBIC_TABLE[f_idx * 4 + 3]) >> 15;
+            return static_cast<int16_t>(std::clamp(out, -32768, 32767)) & ~1;
         }
 
         case InterpolationMode::Gauss:
         default: {
             int f_idx = (v.pitch_dec >> 8) & 0xFF;
-            int c0 = GAUSS_TABLE[f_idx];
-            int c1 = GAUSS_TABLE[256 + f_idx];
-            int c2 = GAUSS_TABLE[512 + f_idx];
-            int c3 = GAUSS_TABLE[768 + f_idx];
-            int32_t out = (s0 * c3 + s1 * c2 + s2 * c1 + s3 * c0) >> 15;
-            return static_cast<int16_t>(std::clamp(out, -32768, 32767));
+            // Interleaved mapping matching Point4Int: s0*c3 + s1*c2 + s2*c1 + s3*c0
+            int32_t out = (s0 * GAUSS_TABLE[768 + f_idx] +
+                           s1 * GAUSS_TABLE[512 + f_idx] +
+                           s2 * GAUSS_TABLE[256 + f_idx] +
+                           s3 * GAUSS_TABLE[f_idx]) >> 15;
+            return static_cast<int16_t>(std::clamp(out, -32768, 32767)) & ~1;
         }
     }
 }
 
+// 32-bit Fibonacci LFSR matching DSP.asm NoiseGen
 void Dsp::step_noise() {
-    if (noise_period == 0) return;
+    if (noise_rate == 0) return;
 
-    if (--noise_counter == 0) {
-        noise_counter = noise_period;
-        uint16_t feedback = (noise_lfsr & 1) ^ ((noise_lfsr >> 1) & 1);
-        noise_lfsr = (noise_lfsr >> 1) | (feedback << 14);
-        noise_sample = static_cast<int16_t>(noise_lfsr << 1);
+    uint32_t old_acc = noise_acc;
+    noise_acc += noise_rate;
+    if (noise_acc < old_acc) { // Unsigned 32-bit carry
+        noise_seed <<= 1;
+        if (static_cast<int32_t>(noise_seed) < 0) { // SF == 1
+            noise_seed ^= 0x40001u;
+        }
+        noise_sample = static_cast<int16_t>(static_cast<int32_t>(noise_seed) >> 16);
     }
 }
 
@@ -622,45 +699,42 @@ void Dsp::process_echo(float in_l, float in_r, float& out_l, float& out_r, bool 
     int16_t raw_ram_l = static_cast<int16_t>(apu_ram[cur_addr] | (apu_ram[(cur_addr + 1) & 0xFFFF] << 8));
     int16_t raw_ram_r = static_cast<int16_t>(apu_ram[(cur_addr + 2) & 0xFFFF] | (apu_ram[(cur_addr + 3) & 0xFFFF] << 8));
 
-    float echo_l = raw_ram_l / 32768.0f;
-    float echo_r = raw_ram_r / 32768.0f;
+    float echo_l = zero_dn(raw_ram_l / 32768.0f);
+    float echo_r = zero_dn(raw_ram_r / 32768.0f);
 
+    fir_cur = (fir_cur == 0) ? (FIR_RING_SIZE - 1) : (fir_cur - 1);
     fir_buf[fir_cur * 2]     = echo_l;
     fir_buf[fir_cur * 2 + 1] = echo_r;
 
     float filtered_l = 0.0f;
     float filtered_r = 0.0f;
 
-    // 0x80 (DSP_NOFIR: Disable FIR Filter)
-    if (dsp_options & 0x80) {
+    if (dsp_options & 0x80) { // 0x80: Disable FIR
         filtered_l = echo_l;
         filtered_r = echo_r;
     } else {
         for (int tap = 0; tap < 8; ++tap) {
-            size_t idx = (fir_cur + tap + 1) % 8;
+            size_t idx = (fir_cur + tap) % FIR_RING_SIZE;
             float coeff = static_cast<int8_t>(regs.raw[(tap << 4) | 0x0F]) / 128.0f;
             filtered_l += fir_buf[idx * 2]     * coeff;
             filtered_r += fir_buf[idx * 2 + 1] * coeff;
         }
     }
 
-    fir_cur = (fir_cur + 1) % 8;
-
-    filtered_l = std::clamp(filtered_l, -1.0f, 1.0f);
-    filtered_r = std::clamp(filtered_r, -1.0f, 1.0f);
+    filtered_l = zero_dn(std::clamp(filtered_l, -1.0f, 1.0f));
+    filtered_r = zero_dn(std::clamp(filtered_r, -1.0f, 1.0f));
 
     out_l = filtered_l;
     out_r = filtered_r;
 
-    // Feedback mixing with crosstalk
-    float fb_l = std::clamp(in_l + (filtered_l * echo_fb + filtered_r * echo_fb_ct), -1.0f, 1.0f);
-    float fb_r = std::clamp(in_r + (filtered_r * echo_fb + filtered_l * echo_fb_ct), -1.0f, 1.0f);
+    // Echo feedback with crosstalk
+    float fb_l = zero_dn(std::clamp(in_l + (filtered_l * echo_fb + filtered_r * echo_fb_ct), -1.0f, 1.0f));
+    float fb_r = zero_dn(std::clamp(in_r + (filtered_r * echo_fb + filtered_l * echo_fb_ct), -1.0f, 1.0f));
 
     if (echo_write_enabled) {
         int16_t ram_out_l, ram_out_r;
 
-        // 0x800 (DSP_ECHOFIR: Authentic 16-bit hardware truncation)
-        if (dsp_options & 0x800) {
+        if (dsp_options & 0x800) { // 0x800: Authentic 16-bit truncation
             int32_t il = static_cast<int32_t>(fb_l * 32768.0f);
             int32_t ir = static_cast<int32_t>(fb_r * 32768.0f);
             ram_out_l = static_cast<int16_t>(std::clamp(il, -32768, 32767)) & ~1;
@@ -681,9 +755,17 @@ void Dsp::process_echo(float in_l, float in_r, float& out_l, float& out_r, bool 
         echo_ram_ptr = 0;
     }
 }
+void Dsp::get_voice_scope(int voice, int16_t* out_buf, size_t count) const {
+    if (voice < 0 || voice >= 8 || !out_buf || count == 0) return;
+    size_t samples_to_copy = std::min(count, SCOPE_RING_SIZE);
+    size_t read_idx = (scope_write_ptr + SCOPE_RING_SIZE - samples_to_copy) % SCOPE_RING_SIZE;
 
+    for (size_t i = 0; i < samples_to_copy; ++i) {
+        out_buf[i] = voice_scope_buf[voice][(read_idx + i) % SCOPE_RING_SIZE];
+    }
+}
 void Dsp::render(int16_t* output_buffer, size_t num_samples) {
-    const float pitch_mul = get_total_pitch_multiplier();
+    const float pitch_mul = key_shift_multiplier * (pitch_sync_speed ? speed_multiplier : 1.0f);
 
     for (size_t smp = 0; smp < num_samples; ++smp) {
         step_noise();
@@ -700,28 +782,32 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
 
             if (v.flags.inactive) {
                 v.last_output = 0;
+                voice_scope_buf[i][scope_write_ptr] = 0; // Write silence for inactive voices
                 continue;
             }
 
-            int32_t p = (dsp_options & 0x40) ? (v.latched_pitch >> 4) : 
-                        ((regs.raw[(i << 4) | 2] | (regs.raw[(i << 4) | 3] << 8)) & 0x3FFF);
+            int32_t p = (dsp_options & 0x40) ? v.latched_pitch : v.original_pitch;
 
+            // Pitch Modulation matching DSP.asm: P' = (P * (OUTX + 32768)) >> 15
             if (i > 0 && (pmon & (1 << i)) && !(dsp_options & 0x20)) {
                 int32_t prev_out = voices[i - 1].last_output;
-                p += ((prev_out >> 5) * p) >> 10;
-                p = std::clamp(p, 0, 0x3FFF);
+                p = (p * (prev_out + 32768)) >> 15;
+                if (!(dsp_options & 0x04)) {
+                    p = std::clamp(p, 0, 0x3FFF);
+                }
             }
 
-            v.pitch_rate = static_cast<uint32_t>((p << 4) * pitch_mul);
+            uint32_t p_adj = static_cast<uint32_t>((static_cast<uint64_t>(pitch_base_hz) << 20) / 32000);
+            uint64_t product = static_cast<uint64_t>(p) * p_adj;
+            uint32_t rounded = static_cast<uint32_t>((product >> 16) + ((product >> 15) & 1));
+            v.pitch_rate = static_cast<uint32_t>(rounded * pitch_mul);
 
-            // 0x200 (DSP_NOENV: Disable Envelope)
-            if (dsp_options & 0x200) {
+            if (dsp_options & 0x200) { // 0x200: Disable Envelope
                 v.env_val = 2047;
             } else {
                 update_envelope(v, i);
             }
 
-            // 0x400 (DSP_NONOISE: Disable Noise Generator)
             bool use_noise = ((non | channel_noise_mask) & (1 << i)) != 0;
             if (dsp_options & 0x400) use_noise = false;
 
@@ -731,7 +817,7 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
             float scaled_sample = (raw_sample * env_scale) / 32768.0f;
 
             int32_t out16 = static_cast<int32_t>(raw_sample * env_scale);
-            v.last_output = static_cast<int16_t>(std::clamp(out16, -32768, 32767));
+            v.last_output = static_cast<int16_t>(std::clamp(out16, -32768, 32767)) & ~1;
 
             regs.raw[(i << 4) | 0x08] = static_cast<uint8_t>(v.env_val >> 4);
             regs.raw[(i << 4) | 0x09] = static_cast<uint8_t>(v.last_output >> 8);
@@ -747,14 +833,18 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
             mix_main_l += sample_l;
             mix_main_r += sample_r;
 
+            // Record active voice output to oscilloscope
+            int16_t scope_smp = (channel_mute_mask & (1 << i)) ? 0 : v.last_output;
+            voice_scope_buf[i][scope_write_ptr] = scope_smp;
+
             if (eon & (1 << i)) {
                 mix_echo_l += sample_l;
                 mix_echo_r += sample_r;
             }
 
-            uint32_t new_dec = v.pitch_dec + v.pitch_rate;
+            uint32_t new_dec = v.pitch_dec + (v.pitch_rate & 0xFFFF);
+            int advance = (v.pitch_rate >> 16) + (new_dec >> 16);
             v.pitch_dec = new_dec & 0xFFFF;
-            int advance = new_dec >> 16;
 
             for (int a = 0; a < advance; ++a) {
                 v.sample_index++;
@@ -764,8 +854,8 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
                         v.last_output = 0;
                         break;
                     }
-                    v.sample_index = 0;
                     decode_brr_block(v);
+                    v.sample_index = 0;
                     if (v.flags.inactive) {
                         v.last_output = 0;
                         break;
@@ -774,7 +864,10 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
             }
         }
 
-        // Echo Processing
+        // Advance write pointer once per output sample after all 8 voices are written
+        scope_write_ptr = (scope_write_ptr + 1) % SCOPE_RING_SIZE;
+
+        // Echo processing
         float echo_out_l = 0.0f, echo_out_r = 0.0f;
         bool echo_write_enabled = !(regs.raw[0x6C] & 0x20) && !(dsp_options & 0x10);
         process_echo(mix_echo_l, mix_echo_r, echo_out_l, echo_out_r, echo_write_enabled);
@@ -792,13 +885,12 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
             bass.process(out_l, out_r);
         }
 
-        // 0x01: Analog Low-Pass Filter
+        // 0x01: Analog Bilinear Anti-Aliasing Filter
         if (dsp_options & 0x01) {
-            aaf1.process(out_l, out_r);
-            aaf2.process(out_l, out_r);
+            aaf.process(out_l, out_r);
         }
 
-        // Stereo Separation Matrixing (0 = mono, 65536 = 100% stereo)
+        // Stereo separation
         float sep_factor = std::clamp(static_cast<float>(stereo_sep_value) / 65536.0f, 0.0f, 1.0f);
         float mid = (out_l + out_r) * 0.5f;
         out_l = mid + (out_l - mid) * sep_factor;
@@ -818,11 +910,10 @@ void Dsp::render(int16_t* output_buffer, size_t num_samples) {
     }
 }
 
-// Fast step for seeking (bypasses heavy filters)
 void Dsp::render_fast() {
     int16_t dummy[2];
     uint32_t saved_opts = dsp_options;
-    dsp_options &= ~(0x01 | 0x100); // Disable AAF & Bass Boost during fast seeking
+    dsp_options &= ~(0x01 | 0x100);
     render(dummy, 1);
     dsp_options = saved_opts;
 }
@@ -835,14 +926,18 @@ void Dsp::fix_after_load() {
 
     update_echo_feedback();
 
-    noise_period  = RATE_TABLE[regs.raw[0x6C] & 0x1F];
-    noise_counter = noise_period;
+    uint8_t n_val = regs.raw[0x6C] & 0x1F;
+    if (n_val == 0) {
+        noise_rate = 0;
+    } else {
+        uint32_t rate_val = RATE_TABLE[n_val] << 16;
+        uint64_t num = (static_cast<uint64_t>(65535) << 32) | 0xFFFFFFFFULL;
+        noise_rate = static_cast<uint32_t>(num / rate_val);
+    }
 
     uint8_t edl = regs.raw[0x7D] & 0x0F;
     echo_length = (edl == 0) ? 4 : (edl * 2048);
     if (echo_ram_ptr >= echo_length) echo_ram_ptr = 0;
-
-    const float pitch_mul = get_total_pitch_multiplier();
 
     for (int i = 0; i < 8; ++i) {
         auto& v = voices[i];
@@ -852,9 +947,13 @@ void Dsp::fix_after_load() {
         v.current_vol_r = v.target_vol_r;
 
         uint16_t p = regs.raw[(i << 4) | 2] | (regs.raw[(i << 4) | 3] << 8);
-        v.original_pitch = (p & 0x3FFF) << 4;
+        v.original_pitch = (dsp_options & 0x04) ? p : (p & 0x3FFF);
         v.latched_pitch  = v.original_pitch;
-        v.pitch_rate     = static_cast<uint32_t>(v.latched_pitch * pitch_mul);
+
+        uint32_t p_adj = static_cast<uint32_t>((static_cast<uint64_t>(pitch_base_hz) << 20) / 32000);
+        uint64_t product = static_cast<uint64_t>(v.latched_pitch) * p_adj;
+        uint32_t rounded = static_cast<uint32_t>((product >> 16) + ((product >> 15) & 1));
+        v.pitch_rate = static_cast<uint32_t>(rounded * key_shift_multiplier * (pitch_sync_speed ? speed_multiplier : 1.0f));
 
         uint8_t envx = regs.raw[(i << 4) | 0x08];
         if (envx > 0 || (regs.raw[0x4C] & (1 << i))) {

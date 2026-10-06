@@ -14,7 +14,7 @@ typedef struct {
     uint8_t  dsp_regs[128];
 } SnesApuVisualState;
 #pragma pack(pop)
-
+void snesapu_render_raw(void* handle, void* out_raw_buf, size_t num_samples);
 void* snesapu_create(void);
 void  snesapu_destroy(void* apu);
 void  snesapu_reset(void* apu);
@@ -25,6 +25,12 @@ void  snesapu_set_sample_rate(void* apu, uint32_t rate);
 void  snesapu_set_speed(void* apu, float speed);
 void  snesapu_set_amp(void* apu, float amp);
 void  snesapu_get_visual_state(void* apu, SnesApuVisualState* state);
+void snesapu_set_bit_depth(void* apu, int bits);
+void snesapu_render_raw(void* handle, void* out_raw_buf, size_t num_samples);
+void snesapu_set_channels(void* apu, int ch);
+void snesapu_render_float(void* handle, float* out_l, float* out_r, size_t num_samples);
+void snesapu_get_voice_scope(void* handle, int voice, int16_t* out_buf, size_t count);
+void snesapu_set_song_length(void* apu, uint32_t song_ticks, uint32_t fade_ticks);
 
 void  snesapu_set_channel_mute(void* apu, uint8_t mask);
 void  snesapu_set_channel_noise(void* apu, uint8_t mask);

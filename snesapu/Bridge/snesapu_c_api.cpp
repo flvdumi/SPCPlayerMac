@@ -47,13 +47,34 @@ void snesapu_render(void* handle, int16_t* out_stereo_buf, size_t num_samples) {
         reinterpret_cast<SnesApu*>(handle)->render(out_stereo_buf, num_samples);
     }
 }
-
-void snesapu_set_sample_rate(void* handle, uint32_t rate) {
-    (void)handle;
-    (void)rate;
-    // SnesApu natively renders at 32000Hz; AVAudioEngine handles resample/output
+void snesapu_set_bit_depth(void* apu, int bits) {
+    if (apu) static_cast<SnesApu*>(apu)->set_bit_depth(bits);
 }
 
+void snesapu_set_channels(void* apu, int ch) {
+    if (apu) static_cast<SnesApu*>(apu)->set_channels(ch);
+}
+
+void snesapu_set_song_length(void* apu, uint32_t song_ticks, uint32_t fade_ticks) {
+    if (apu) static_cast<SnesApu*>(apu)->set_song_length(song_ticks, fade_ticks);
+}
+void snesapu_set_sample_rate(void* handle, uint32_t rate) {
+    if (handle) {
+        reinterpret_cast<SnesApu*>(handle)->set_output_sample_rate(rate);
+    }
+}
+
+void snesapu_render_float(void* handle, float* out_l, float* out_r, size_t num_samples) {
+    if (handle && out_l && out_r) {
+        reinterpret_cast<SnesApu*>(handle)->render_float(out_l, out_r, num_samples);
+    }
+}
+
+void snesapu_render_raw(void* handle, void* out_raw_buf, size_t num_samples) {
+    if (handle && out_raw_buf) {
+        reinterpret_cast<SnesApu*>(handle)->render(out_raw_buf, num_samples);
+    }
+}
 void snesapu_set_speed(void* handle, float multiplier) {
     if (handle) {
         auto* apu = reinterpret_cast<SnesApu*>(handle);
@@ -106,11 +127,12 @@ void snesapu_set_stereo_separation(void* handle, uint32_t sep) {
     }
 }
 
+// In snesapu_c_api.cpp:
 void snesapu_set_feedback_mixer(void* handle, uint32_t fb) {
-    (void)handle;
-    (void)fb;
+    if (handle) {
+        reinterpret_cast<SnesApu*>(handle)->get_dsp().set_feedback_mixer(fb);
+    }
 }
-
 void snesapu_set_pitch_base_hz(void* handle, uint32_t hz) {
     if (handle) {
         reinterpret_cast<SnesApu*>(handle)->get_dsp().set_pitch_base_hz(hz);
@@ -143,21 +165,15 @@ void snesapu_set_interpolation(void* handle, uint8_t mode) {
     }
 }
 
+// In snesapu_c_api.cpp:
 void snesapu_seek(void* handle, uint32_t target_ticks) {
     if (!handle) return;
     auto* apu = reinterpret_cast<SnesApu*>(handle);
-    uint32_t cur = apu->get_spc().get_state().t64_cnt;
-    if (target_ticks > cur) {
-        uint32_t diff_ticks = target_ticks - cur;
-        size_t samples = static_cast<size_t>(diff_ticks / 2);
-        
-        std::vector<int16_t> dummy(1024 * 2);
-        while (samples > 0) {
-            size_t step = std::min<size_t>(samples, 1024);
-            apu->render(dummy.data(), step);
-            samples -= step;
-        }
+    apu->seek(target_ticks); // Instant CPU-only fast seek
+}
+void snesapu_get_voice_scope(void* handle, int voice, int16_t* out_buf, size_t count) {
+    if (handle && out_buf) {
+        reinterpret_cast<SnesApu*>(handle)->get_dsp().get_voice_scope(voice, out_buf, count);
     }
 }
-
 } // extern "C"

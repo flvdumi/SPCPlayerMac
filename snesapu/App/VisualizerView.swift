@@ -8,7 +8,6 @@ extension SnesApuVisualState {
         withUnsafeBytes(of: env_levels) { $0[index & 0x07] }
     }
     func voiceOut(_ index: Int) -> Int16 {
-        // Safe unaligned byte load for #pragma pack(1) compatibility on ARM64
         withUnsafeBytes(of: voice_outs) { raw in
             let offset = (index & 0x07) * 2
             let lo = UInt16(raw[offset])
@@ -20,15 +19,16 @@ extension SnesApuVisualState {
 
 final class VisualizerView: NSView {
     enum ViewMode: Int, CaseIterable {
-        case indicator = 0
-        case mixer     = 1
-        case channel1  = 2
-        case channel2  = 3
-        case channel3  = 4
-        case channel4  = 5
-        case tags1     = 6
-        case tags2     = 7
-        case script700 = 8
+        case indicator    = 0
+        case mixer        = 1
+        case channel1     = 2
+        case channel2     = 3
+        case channel3     = 4
+        case channel4     = 5
+        case tags1        = 6
+        case tags2        = 7
+        case script700    = 8
+        case oscilloscope = 9
     }
 
     var viewMode: ViewMode = .indicator { didSet { needsDisplay = true } }
@@ -37,6 +37,21 @@ final class VisualizerView: NSView {
 
     private var isScrubbing = false
     private var scrubRatio: Double = 0.0
+
+    // Scope telemetry tracking for flicker-free terminal scope
+    private var scopeActivity: [CGFloat] = Array(repeating: 0.0, count: 8)
+    private var scopeLastTrigger: [Int] = Array(repeating: 0, count: 8)
+
+    private let channelColors: [NSColor] = [
+        NSColor(hex: "#00FF66"), // Ch 1: Green
+        NSColor(hex: "#00E5FF"), // Ch 2: Cyan
+        NSColor(hex: "#FFDD00"), // Ch 3: Yellow
+        NSColor(hex: "#FF3366"), // Ch 4: Red
+        NSColor(hex: "#BF55EC"), // Ch 5: Purple
+        NSColor(hex: "#FF8800"), // Ch 6: Orange
+        NSColor(hex: "#3388FF"), // Ch 7: Blue
+        NSColor(hex: "#00FFAA")  // Ch 8: Mint
+    ]
 
     override var isFlipped: Bool { true }
 
@@ -48,26 +63,136 @@ final class VisualizerView: NSView {
         ctx.saveGState()
         ctx.scaleBy(x: scaleX, y: scaleY)
 
-        ctx.setFillColor(NSColor(hex: "#1C1C1C").cgColor)
+        ctx.setFillColor(NSColor(hex: "#141416").cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: 287, height: 96))
 
         let state = engine.getVisualState()
 
         switch viewMode {
-        case .indicator: drawIndicatorView(ctx: ctx, state: state, engine: engine)
-        case .mixer:     drawMixerView(ctx: ctx, state: state, engine: engine)
-        case .channel1:  drawChannel1View(ctx: ctx, state: state)
-        case .channel2:  drawChannel2View(ctx: ctx, state: state)
-        case .channel3:  drawChannel3View(ctx: ctx, state: state)
-        case .channel4:  drawChannel4View(ctx: ctx, state: state)
-        case .tags1:     drawTags1View(ctx: ctx, state: state, engine: engine)
-        case .tags2:     drawTags2View(ctx: ctx, state: state, engine: engine)
-        case .script700: drawScript700View(ctx: ctx, state: state)
+        case .indicator:    drawIndicatorView(ctx: ctx, state: state, engine: engine)
+        case .mixer:        drawMixerView(ctx: ctx, state: state, engine: engine)
+        case .channel1:     drawChannel1View(ctx: ctx, state: state)
+        case .channel2:     drawChannel2View(ctx: ctx, state: state)
+        case .channel3:     drawChannel3View(ctx: ctx, state: state)
+        case .channel4:     drawChannel4View(ctx: ctx, state: state)
+        case .tags1:        drawTags1View(ctx: ctx, state: state, engine: engine)
+        case .tags2:        drawTags2View(ctx: ctx, state: state, engine: engine)
+        case .script700:    drawScript700View(ctx: ctx, state: state)
+        case .oscilloscope: drawTerminalScopeView(ctx: ctx, engine: engine)
         }
 
         ctx.restoreGState()
     }
 
+    // MARK: - In-Terminal 8-Channel Oscilloscope (Mode 9)
+    private func drawTerminalScopeView(ctx: CGContext, engine: SpcEngine) {
+        let laneHeight: CGFloat = 96.0 / 8.0 // 12.0 pixels per channel
+        let displayPoints = 256
+        let waveStartX: CGFloat = 22.0
+        let waveWidth: CGFloat = 287.0 - waveStartX - 4.0
+
+        // Vertical lane divider between channel numbers and waveforms
+        ctx.setStrokeColor(NSColor(hex: "#24242A").cgColor)
+        ctx.setLineWidth(1.0)
+        ctx.strokeLineSegments(between: [CGPoint(x: waveStartX - 2.0, y: 0), CGPoint(x: waveStartX - 2.0, y: 96)])
+
+        for ch in 0..<8 {
+            let laneY = CGFloat(ch) * laneHeight
+            let midY = laneY + (laneHeight / 2.0)
+            let isMuted = (engine.channelMuteMask & (1 << ch)) != 0
+            let themeColor = channelColors[ch]
+
+            // Horizontal dividers and zero-center line
+            ctx.setStrokeColor(NSColor(hex: "#1E1E22").cgColor)
+            ctx.strokeLineSegments(between: [CGPoint(x: 0, y: laneY), CGPoint(x: 287, y: laneY)])
+
+            ctx.setStrokeColor(NSColor(hex: "#18181C").cgColor)
+            ctx.strokeLineSegments(between: [CGPoint(x: waveStartX, y: midY), CGPoint(x: 287, y: midY)])
+
+            // Channel number badge (steady, no strobe)
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .bold),
+                .foregroundColor: isMuted ? NSColor(hex: "#555555") : themeColor
+            ]
+            let label = isMuted ? "M\(ch + 1)" : " \(ch + 1)"
+            label.draw(at: CGPoint(x: 2, y: laneY + 1.5), withAttributes: labelAttrs)
+
+            // Fetch live voice samples
+            let rawSamples = engine.getVoiceScope(channel: ch, count: 512)
+
+            var peakAmp: Int32 = 0
+            for s in rawSamples {
+                let absVal = abs(Int32(s))
+                if absVal > peakAmp { peakAmp = absVal }
+            }
+
+            // Smooth envelope follower to prevent flicker
+            let rawAct: CGFloat = (!isMuted && peakAmp > 120) ? 1.0 : 0.0
+            if rawAct > scopeActivity[ch] {
+                scopeActivity[ch] = rawAct
+            } else {
+                scopeActivity[ch] = max(0.0, scopeActivity[ch] * 0.86)
+            }
+            let activity = scopeActivity[ch]
+
+            // Trigger locking
+            var startIdx = 0
+            let searchLimit = min(128, rawSamples.count - displayPoints)
+            if peakAmp > 150 && !isMuted {
+                let thresh = max(Int32(64), peakAmp / 8)
+                var found = false
+                for i in 1..<searchLimit {
+                    if rawSamples[i - 1] <= 0 && rawSamples[i] > 0 &&
+                       (Int32(rawSamples[i]) - Int32(rawSamples[i - 1]) >= thresh) {
+                        startIdx = i
+                        scopeLastTrigger[ch] = i
+                        found = true
+                        break
+                    }
+                }
+                if !found { startIdx = min(scopeLastTrigger[ch], searchLimit) }
+            }
+
+            // Draw channel waveform
+            if activity > 0.02 && !isMuted {
+                let path = CGMutablePath()
+                let xStep = waveWidth / CGFloat(displayPoints - 1)
+                var first = true
+
+                for i in 0..<displayPoints {
+                    let sIdx = startIdx + i
+                    guard sIdx < rawSamples.count else { break }
+                    let norm = CGFloat(rawSamples[sIdx]) / 32768.0
+
+                    let px = waveStartX + CGFloat(i) * xStep
+                    let py = midY - (norm * (laneHeight * 0.42))
+
+                    if first {
+                        path.move(to: CGPoint(x: px, y: py))
+                        first = false
+                    } else {
+                        path.addLine(to: CGPoint(x: px, y: py))
+                    }
+                }
+
+                ctx.saveGState()
+                ctx.setStrokeColor(themeColor.withAlphaComponent(0.3 + 0.7 * activity).cgColor)
+                ctx.setLineWidth(1.1)
+                ctx.setLineJoin(.round)
+                ctx.setLineCap(.round)
+                ctx.addPath(path)
+                ctx.strokePath()
+                ctx.restoreGState()
+            } else {
+                // Flat silent center line
+                ctx.setStrokeColor(NSColor(hex: "#222226").cgColor)
+                ctx.setLineWidth(1.0)
+                ctx.strokeLineSegments(between: [CGPoint(x: waveStartX, y: midY), CGPoint(x: 287, y: midY)])
+            }
+        }
+    }
+
+    // MARK: - Existing Panels
     private func drawIndicatorView(ctx: CGContext, state: SnesApuVisualState, engine: SpcEngine) {
         let textAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
@@ -371,6 +496,7 @@ final class VisualizerView: NSView {
             }
             needsDisplay = true
         } else {
+            // Cycle modes smoothly
             let nextMode = (viewMode.rawValue + 1) % ViewMode.allCases.count
             viewMode = ViewMode(rawValue: nextMode)!
         }
