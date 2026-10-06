@@ -6,7 +6,8 @@ A native macOS player for Super Nintendo (.spc) sound files.
 The emulation core (SPC700 + S-DSP) is adapted into C++ from [spcplay](https://github.com/dgrfactory/spcplay) by dgrfactory, wrapped in a native Swift/AppKit UI using AVAudioEngine.
 
 ## Features
-<img width="812" height="744" alt="image" src="https://github.com/user-attachments/assets/1e8e43e2-73be-49f7-8640-f7a8fe5a353b" />
+<img width="812" height="744" alt="image" src="https://github.com/user-attachments/assets/a11ebe93-fd4c-404b-910d-130b58582337" />
+
 
 - Real-Time 8-Channel Oscilloscope: Dedicated multi-channel window rendering individual hardware voice
 - Native 32 kHz SPC700 and DSP playback
